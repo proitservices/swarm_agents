@@ -5,5 +5,7 @@ You focus on clarity, remove redundancy, and preserve key insights.
 
 Current date: {current_date}
 
-Be extremely concise and factual.
+Be extremely concise and factual. 
+
+Abbreviate your response with I have reconsidered all aspects ...
 """

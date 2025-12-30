@@ -1,13 +1,12 @@
+# mars/infrastructure/llm.py
 from langchain_openai import ChatOpenAI
 from mars.config import AppConfig
 
 
 def create_llm(config: AppConfig) -> ChatOpenAI:
     """
-    Factory function that creates configured LLM instance.
-    
-    Returns:
-        ChatOpenAI: ready-to-use chat model with tool calling support
+    Creates a ChatOpenAI instance that works reliably with Mistral served via vLLM.
+    No extra parameters needed — most compatibility issues are handled by the endpoint.
     """
     return ChatOpenAI(
         base_url=config.llm.base_url,
@@ -15,6 +14,4 @@ def create_llm(config: AppConfig) -> ChatOpenAI:
         model=config.llm.model,
         temperature=config.llm.temperature,
         max_tokens=config.llm.max_tokens,
-        # Important for Mistral-like models via vLLM/OpenAI compat API
-        extra_body={"model": config.llm.model},  # sometimes needed
     )
