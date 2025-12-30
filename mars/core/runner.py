@@ -1,71 +1,90 @@
-# mars/core/runner.py
+# ./mars/core/runner.py
 """
-Simple runner for early development stage - orchestrator + summary
+High-level runner facade for the MARS swarm graph.
+Initializes LLM, graph and executes workflows with proper checkpointing.
+Handles thread management for persistence and state resumption.
 """
 
 # imports
+from typing import List
+
+from langchain_core.messages import AnyMessage, HumanMessage
+
 from mars.config import AppConfig
 from mars.infrastructure.llm import create_llm
-from mars.core.state import BasicAgentState
-from mars.agents.orchestrator.agent import create_orchestrator_node
-from mars.agents.summary.agent import create_summary_node
-from langchain_core.messages import HumanMessage
+from mars.core.graph import MARSGraph
+from mars.core.state import MARSState
 
 
-class SimpleRunner:
-    """Minimal runner to test multi-agent coordination"""
+class MARSRunner:
+    """
+    Core runner class that ties configuration, LLM and graph together.
+    Provides simple run interface while managing thread_id for checkpointer.
+    """
 
     def __init__(self, config: AppConfig):
+        """
+        Initializes the runner with configuration.
+
+        Args:
+            config (AppConfig): Application-wide configuration object
+        """
         self.config = config
         self.llm = create_llm(config)
-        self.orchestrator = create_orchestrator_node(self.llm)
+        self.graph = MARSGraph(self.llm)
+        self.thread_id = "mars-thread-001"  # Fixed thread ID for prototype
 
-    def run_once(self, user_message: str) -> str:
+    def run(self, user_message: str) -> str:
         """
-        Orchestrator → optional summary → final answer from orchestrator
+        Executes the full MARS swarm workflow for a single user query.
+
+        Args:
+            user_message (str): User input question/query
+
+        Returns:
+            str: Final answer extracted from the last message
         """
-        initial_state = BasicAgentState(messages=[HumanMessage(content=user_message)])
+        # Prepare initial state
+        initial_state: MARSState = {
+            "messages": [HumanMessage(content=user_message)],
+            "core_context": {},
+            "thoughts": [],
+            "injection_queue": [],
+            "active_agent": "orchestrator",
+            "last_handoff_reason": None
+        }
 
-        # ── Orchestrator ─────────────────────────────────────────────────────
-        print("=== orchestrator ===")
-        orch_result = self.orchestrator(initial_state)
-        messages = orch_result["messages"]
-        orch_content = messages[-1].content
-        print(orch_content)
-        print("=== end of orchestrator ===\n")
+        # Prepare LangGraph config with required thread_id
+        graph_config = {
+            "configurable": {
+                "thread_id": self.thread_id,
+            }
+        }
 
-        # Decide whether to call summary (simple keyword check for now)
-        should_summarize = any(
-            word in orch_content.lower()
-            for word in ["summarize", "condense", "short", "summary"]
+        # Execute the graph - pass config correctly to the underlying app
+        # Since MARSGraph.invoke() is a wrapper, we must call the internal app with config
+        final_state = self.graph.app.invoke(
+            input=initial_state,
+            config=graph_config
         )
 
-        if should_summarize:
-            print("→ Calling Summary Agent...\n")
-            print("=== summary ===")
-            summary_node = create_summary_node(self.llm)
-            summary_result = summary_node(BasicAgentState(messages=messages))
-            summary_content = summary_result["messages"][-1].content
-            print(summary_content)
-            print("=== end of summary ===\n")
-        else:
-            summary_content = None
+        # Extract final answer from messages
+        final_messages: List[AnyMessage] = final_state.get("messages", [])
+        if final_messages:
+            return final_messages[-1].content
 
-        # ── Final answer always comes from orchestrator ─────────────────────
-        # We simulate this by asking orchestrator to give final clean version
-        final_prompt = (
-            "You are the Orchestrator. Provide the clean final answer "
-            "based on previous reasoning.\n\n"
-            f"Previous content:\n{orch_content}"
-        )
-        if summary_content:
-            final_prompt += f"\nSummary version:\n{summary_content}"
+        return "No final answer generated (empty message history)."
 
-        final_state = BasicAgentState(messages=[HumanMessage(content=final_prompt)])
-        final_result = self.orchestrator(final_state)
-        final_answer = final_result["messages"][-1].content
 
-        print("Final Answer (produced by orchestrator):")
-        print(final_answer)
+# Core execution block (when file is run directly)
+if __name__ == "__main__":
+    config = AppConfig.default_for_development()
+    runner = MARSRunner(config)
 
-        return final_answer
+    test_query = "Summarize key principles of tort law in New York."
+    print("User:", test_query)
+    print("-" * 50)
+
+    answer = runner.run(test_query)
+    print("Final Answer:")
+    print(answer)
