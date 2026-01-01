@@ -1,120 +1,159 @@
 """
 Memory Swarm coordinator
 Manages sequential evaluation of all active memory agents (simulating parallelism)
+Ensures prime seed thoughts are loaded only once and never duplicated or renamed
+New thoughts from generator get fresh IDs and are appended only when truly novel
+File location: ./mars/agents/memory/swarm.py
 """
 
 # imports
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Set
+from datetime import datetime
 
 from mars.types import MARSState, Thought
 from mars.agents.memory.single import create_single_memory_node
 from mars.infrastructure.logging import get_thought_logger
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Helper classes / functions
+# ──────────────────────────────────────────────────────────────────────────────
 
-# helper classes
-# (none required at swarm level - single agents handle their own logic)
+def _deduplicate_thoughts(thoughts: List[Thought]) -> List[Thought]:
+    """Return list of thoughts keeping only the most recent version of each thought_id"""
+    if not thoughts:
+        return []
+    
+    # Keep the latest version according to last_evaluated timestamp
+    latest_by_id: Dict[str, Thought] = {}
+    for t in thoughts:
+        tid = t["thought_id"]
+        current_ts = t.get("last_evaluated", "1970-01-01T00:00:00")
+        existing_ts = latest_by_id.get(tid, {}).get("last_evaluated", "1970-01-01T00:00:00")
+        if tid not in latest_by_id or current_ts > existing_ts:
+            latest_by_id[tid] = t
+    
+    return list(latest_by_id.values())
 
+def _safe_extract_content(last_msg: Any) -> str:
+    """Safely extracts content from any LangChain message object (AIMessage, HumanMessage, etc.)"""
+    if last_msg is None:
+        return ""
+    return getattr(last_msg, 'content', str(last_msg)) or ""
 
-# operational classes
-# (thought generator imported lazily to avoid circular imports)
-
-
+# ──────────────────────────────────────────────────────────────────────────────
 # Core factory
+# ──────────────────────────────────────────────────────────────────────────────
+
 def create_memory_swarm_node(llm):
     """
-    Creates the memory swarm node - evaluates all existing thoughts.
-
-    Args:
-        llm: Language model instance used by individual memory agents
-
-    Returns:
-        Callable[[MARSState], dict]: Node function returning only delta updates
+    Factory that creates the memory swarm evaluation node.
+    The node evaluates existing thoughts, decides on injection/reframing/new generation,
+    prevents any thought ID duplication and keeps the state clean.
     """
     def swarm_node(state: MARSState) -> Dict[str, Any]:
         """
         Main swarm processing logic:
-        - Loops through all current thoughts
-        - Runs dedicated memory agent for each
-        - Applies simple mock scoring (0.85 for applicable)
-        - Logs evaluation decision per thought
-        - Builds injection queue and updated thoughts list
+          - Deduplicates thoughts by id (keeping most recent version)
+          - Evaluates each unique thought against current orchestrator context
+          - Applies simple relevance decision (mock scoring for now)
+          - Logs evaluation decisions
+          - Queues highly relevant thoughts for injection
+          - Reframes low-relevance thoughts in place
+          - Triggers new thought generation on strong mismatch/conflict
+          - Appends only genuinely new thoughts with unique IDs
+
+        Args:
+            state: Current MARS shared state
 
         Returns:
-            dict: Only the keys that changed (for safe merging)
+            Dict[str, Any]: Delta updates containing:
+                - thoughts: updated list (with possible new entries)
+                - injection_queue: thoughts ready for summary merging
+                - active_agent: marker for current active component
         """
-        # Defensive initialization
         thoughts = state.get("thoughts", [])
         if not thoughts:
             return {"injection_queue": [], "active_agent": "memory_swarm"}
 
-        new_queue: List[Thought] = []
-        updated_thoughts = thoughts.copy()  # shallow copy - we replace objects
+        # ── Phase 1: Defensive deduplication ───────────────────────────────
+        unique_thoughts = _deduplicate_thoughts(thoughts)
+        existing_ids: Set[str] = {t["thought_id"] for t in unique_thoughts}
 
-        # Extract current orchestrator context once (same for all thoughts in this cycle)
-        last_msg = state["messages"][-1].content
-        context_snippet = (
-            last_msg[:400] + "..." if len(last_msg) > 400 else last_msg
-        )
+        working_thoughts = unique_thoughts.copy()  # we will append here if needed
+        injection_queue: List[Thought] = []
 
-        for idx, thought in enumerate(thoughts):
-            # Create and run specialized memory agent for this thought
+        # ── Safe context extraction (fixes AIMessage.get() error) ──────────
+        messages = state.get("messages", [])
+        last_msg = messages[-1] if messages else None
+        context_text = _safe_extract_content(last_msg)
+        context_snippet = (context_text[:400] + "...") if len(context_text) > 400 else context_text
+
+        # ── Phase 2: Evaluate each thought ─────────────────────────────────
+        for thought in working_thoughts:
+            # Create specialized memory evaluation agent for this thought
             memory_node = create_single_memory_node(llm, thought)
-            memory_result = memory_node(state)
+            eval_result = memory_node(state)
+            
+            if not eval_result.get("messages"):
+                continue
 
-            # Get latest evaluation message
-            if not memory_result.get("messages"):
-                continue  # skip broken evaluations
+            # Safe content extraction from evaluation result
+            eval_msg = eval_result["messages"][-1]
+            response_text = _safe_extract_content(eval_msg).lower()
 
-            response_text = memory_result["messages"][-1].content.lower()
-
-            # Mock scoring (kept as requested)
-            is_applicable = "applicable" in response_text or "yes" in response_text
+            # ── Simple mock scoring (to be replaced with real CoT + embedding scoring)
+            is_applicable = any(word in response_text for word in ["applicable", "yes", "relevant", "supports"])
             relevance_score = 0.85 if is_applicable else 0.42
 
-            # Log the memory agent's assessment
+            # Decision logic
+            decision = "inject" if relevance_score > 0.70 else "reframe"
+            if any(word in response_text for word in ["mismatch", "conflict", "contradict", "outdated"]):
+                decision = "generate_new"
+
+            # Logging
             thought_logger = get_thought_logger(thought)
-            decision = "inject" if relevance_score > 0.7 else "reframe"
-
-            # Upgrade decision if mismatch detected
-            if "mismatch" in response_text or "conflict" in response_text:
-                decision = "generate_new" if decision == "reframe" else decision
-
             thought_logger.log_evaluation(
                 current_orchestrator_snippet=context_snippet,
                 relevance_score=relevance_score,
                 decision=decision,
-                reasoning=f"Evaluation response: {response_text[:180]}..."
+                reasoning=f"Response snippet: {response_text[:180]}..."
             )
 
-            # Create updated thought version
-            updated = thought.copy()
-            updated["relevance_score"] = relevance_score
-            updated["last_evaluated"] = "now"  # TODO: real timestamp later
+            # Update thought metadata (mutates in place)
+            thought["relevance_score"] = relevance_score
+            thought["last_evaluated"] = datetime.utcnow().isoformat()
 
-            # Apply decision
-            if relevance_score > 0.7:
-                new_queue.append(updated)
-            else:
-                # Minimal re-framing
-                updated["narrative"] = updated.get("narrative", "") + " [re-framed]"
+            # ── Apply decision ─────────────────────────────────────────────
+            if relevance_score > 0.70:
+                injection_queue.append(thought)
 
-                # Optional: mismatch → new thought generation
-                if "mismatch" in response_text or "conflict" in response_text:
-                    try:
-                        from mars.agents.thought_generator.agent import create_thought_generator_node
-                        thought_gen = create_thought_generator_node(llm)
-                        gen_result = thought_gen(state)
-                        if "thoughts" in gen_result and gen_result["thoughts"]:
-                            new_thought = gen_result["thoughts"][-1]
-                            updated_thoughts.append(new_thought)
-                    except Exception as gen_error:
-                        print(f"Warning: New thought generation failed: {gen_error}")
+            if decision == "reframe":
+                # Minimal re-framing marker - can be greatly improved later
+                current_narrative = thought.get("narrative", "")
+                thought["narrative"] = f"{current_narrative} [re-framed with new context: {context_snippet[:100]}...]"
 
-                updated_thoughts[idx] = updated  # replace in place
+            elif decision == "generate_new":
+                # Controlled generation of new thought (limited to prevent hangs)
+                try:
+                    from mars.agents.thought_generator.agent import create_thought_generator_node
+                    thought_gen = create_thought_generator_node(llm, max_steps=2)  # Limit to 2 steps during swarm
+                    gen_delta = thought_gen(state)
+                    new_thoughts = gen_delta.get("thoughts", [])
+                    
+                    for new_thought in new_thoughts:
+                        new_id = new_thought["thought_id"]
+                        if new_id not in existing_ids:
+                            working_thoughts.append(new_thought)
+                            existing_ids.add(new_id)
+                        # Silently skip duplicates
+                        
+                except (ImportError, Exception) as e:
+                    print(f"Warning: New thought generation failed → {str(e)}")
 
+        # ── Final result delta ─────────────────────────────────────────────
         return {
-            "thoughts": updated_thoughts,
-            "injection_queue": new_queue,
+            "thoughts": working_thoughts,
+            "injection_queue": injection_queue,
             "active_agent": "memory_swarm"
         }
 
