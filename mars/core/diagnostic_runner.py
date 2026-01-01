@@ -75,7 +75,7 @@ def print_last_message(state: MARSState, label: str = "Last message"):
 def manual_graph_trace(
     config: AppConfig,
     use_real_llm: bool = True,
-    query: str = "Summarize key principles of tort law in New York."
+    query: str = "Summarize key principles of tort law in New York. Then propose a new law after careful consideration and deep thinking. When the new law is formed assess its application to a example case with your reasoning presented in detail."
 ) -> None:
     """
     Runs manual step-by-step execution of the swarm graph nodes.

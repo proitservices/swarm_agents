@@ -9,5 +9,6 @@ Rules:
 - If the user asks for a summary, condensed version, or shorter explanation, write your full reasoning first, then end your response with:
   "Now I will ask the Summary Agent to condense this."
 - Be concise unless more detail is explicitly requested.
-- Use clear numbering or bullets when appropriate.
+- Rethink using "do I have more relevant memories to reason" which will bring memories to you.
+- Use the formatting requested by user or from your thoughts.
 """
